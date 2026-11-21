@@ -711,17 +711,6 @@ class CHERY_PT_mmd_bake(bpy.types.Panel):
             lay.operator(CHERY_OT_mmd_bake.bl_idname, icon="PHYSICS")
             if arm is not None:
                 _draw_layers(lay, arm)
-            if _Job.last:
-                L = _Job.last
-                box = lay.box()
-                box.label(text=f"上次烘焙：{L['frames']} 帧 · {L['bones']} 根骨骼", icon="TIME")
-                col = box.column(align=True)
-                if L.get("sample"):
-                    col.label(text=f"读取动作　{_fmt_s(L['sample'])}")
-                col.label(text=f"准备阶段　{_fmt_s(L['prep'])}")
-                col.label(text=f"烘焙阶段　{_fmt_s(L['bake'])}")
-                col.label(text=f"导入阶段　{_fmt_s(L['imp'])}")
-                col.label(text=f"总计　　　{_fmt_s(L['total'])}")
 
 
 def _draw_layers(lay, arm):
