@@ -334,6 +334,11 @@ class _Job:
     running = False
     factor = 0.0
     text = ""
+    last = None   # timings of the last finished bake, shown in the panel
+
+
+def _fmt_s(sec):
+    return f"{sec:.1f} s" if sec < 60 else f"{int(sec // 60)} 分 {sec % 60:.0f} 秒"
 
 
 def _redraw_ui():
@@ -396,6 +401,8 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
         for raw in iter(self._proc.stdout.readline, b""):
             line = raw.decode("utf-8", "replace").strip()
             if line:
+                if self._t_bake_start is None and line.startswith("PROGRESS "):
+                    self._t_bake_start = time.time()   # warm-up done, per-frame physics starts
                 self._lines.append(line)
 
     # ---- start ----
@@ -441,8 +448,10 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
             return {"CANCELLED"}
 
         self._lines = []
-        threading.Thread(target=self._reader, daemon=True).start()
         self._t0 = time.time()
+        self._t_bake_start = None
+        self._t_sim_end = None
+        threading.Thread(target=self._reader, daemon=True).start()
         self._t_sim = 0.0
         self._phase = "sim"
         self._gen = None
@@ -494,7 +503,8 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
             msg = " | ".join(l for l in self._lines[-6:] if not l.startswith(("PROGRESS", "WARMUP")))
             self.report({"ERROR"}, f"物理烘焙失败（代码 {rc}）：{msg[-400:]}")
             return self._finish(context, cancelled=True, msg="物理计算失败")
-        self._t_sim = time.time() - self._t0
+        self._t_sim_end = time.time()
+        self._t_sim = self._t_sim_end - self._t0
 
         s, root, arm = self._settings, self._root, self._arm
         if s.clean_rig and root is not None and getattr(root.mmd_root, "is_built", False):
@@ -529,11 +539,30 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
                 if s.auto_offset:
                     s.frame_offset = self._offset
                 context.view_layer.update()
-                self.report({"INFO"},
-                            f"完成：{n} 根物理骨骼，Blender 帧 {f0}-{f1}，比例 {scale:.4f}，"
-                            f"物理计算 {self._t_sim:.1f}s，总计 {time.time() - self._t0:.1f}s")
+                self._report_timing(n, f1 - f0 + 1, f0, f1, scale)
                 return self._finish(context, msg=f"完成 · {n} 根物理骨骼 · {time.time() - self._t0:.1f}s")
         return {"RUNNING_MODAL"}
+
+    def _report_timing(self, bones, frames, f0, f1, scale):
+        t_end = time.time()
+        bake_start = self._t_bake_start or self._t_sim_end
+        prep = bake_start - self._t0
+        bake = self._t_sim_end - bake_start
+        imp = t_end - self._t_sim_end
+        total = t_end - self._t0
+        _Job.last = dict(prep=prep, bake=bake, imp=imp, total=total, frames=frames, bones=bones)
+        lines = [
+            "[CheryStage] MMD 物理烘焙完成",
+            f"  准备阶段：{_fmt_s(prep)}（加载模型与动作、物理预热）",
+            f"  烘焙阶段：{_fmt_s(bake)}（{frames} 帧物理计算）",
+            f"  导入阶段：{_fmt_s(imp)}（写入 {bones} 根物理骨骼的关键帧）",
+            f"  总计：{_fmt_s(total)}　Blender 帧 {f0}-{f1}，比例 {scale:.4f}",
+        ]
+        print("\n".join(lines))                       # system console
+        for line in lines[1:]:                         # Info editor log
+            self.report({"INFO"}, line.strip())
+        # last report wins the status bar: keep it a one-line summary
+        self.report({"INFO"}, f"烘焙完成：准备 {_fmt_s(prep)} · 烘焙 {_fmt_s(bake)} · 导入 {_fmt_s(imp)} · 总计 {_fmt_s(total)}")
 
     def cancel(self, context):
         self._finish(context, cancelled=True)
@@ -605,6 +634,15 @@ class CHERY_PT_mmd_bake(bpy.types.Panel):
             col.label(text="按 Esc 取消", icon="CANCEL")
         else:
             lay.operator(CHERY_OT_mmd_bake.bl_idname, icon="PHYSICS")
+            if _Job.last:
+                L = _Job.last
+                box = lay.box()
+                box.label(text=f"上次烘焙：{L['frames']} 帧 · {L['bones']} 根骨骼", icon="TIME")
+                col = box.column(align=True)
+                col.label(text=f"准备阶段　{_fmt_s(L['prep'])}")
+                col.label(text=f"烘焙阶段　{_fmt_s(L['bake'])}")
+                col.label(text=f"导入阶段　{_fmt_s(L['imp'])}")
+                col.label(text=f"总计　　　{_fmt_s(L['total'])}")
 
 
 _autofill_tried = set()

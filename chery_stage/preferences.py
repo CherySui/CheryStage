@@ -75,7 +75,7 @@ class CheryStagePreferences(bpy.types.AddonPreferences):
         header = layout.box()
         row = header.row(align=True)
         row.label(text="CheryStage - 一站式 MMD 工作流工具箱", icon="COMMUNITY")
-        row.label(text="v1.5.0", icon="INFO")
+        row.label(text="v1.5.1", icon="INFO")
 
         # Modules Section
         box_modules = layout.box()
