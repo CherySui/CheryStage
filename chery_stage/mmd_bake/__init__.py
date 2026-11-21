@@ -14,9 +14,11 @@ import time
 
 import bpy
 import numpy as np
-from bpy.props import BoolProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 
+from . import layers
 from . import paths
+from . import pose_input
 from . import progress_hud
 
 ADDON_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -280,7 +282,8 @@ def apply_bake(arm, data, frame_offset, report):
     del basis
 
 
-    cb = get_channelbag(arm)
+    # physics goes to its own NLA layer; the motion action is never modified
+    act, slot, cb = layers.prepare_physics_action(arm)
     for j, n in enumerate(targets):
         if j % 4 == 0:
             yield ("write", j, len(targets))
@@ -301,13 +304,19 @@ def apply_bake(arm, data, frame_offset, report):
         for ax in range(4):
             write_curve(cb, f'pose.bones["{n}"].rotation_quaternion', ax, grp, xs, quat[:, j, ax])
 
-    yield ("done", (len(targets), scale, int(xs[0]), int(xs[-1])), None)
+    muted = layers.finish_physics_layer(arm, act, slot, set(targets))
+    yield ("done", (len(targets), scale, int(xs[0]), int(xs[-1]), muted), None)
 
 
 # --------------------------------------------------------------------------- #
 # UI / operator
 # --------------------------------------------------------------------------- #
 class CheryMMDBakeSettings(bpy.types.PropertyGroup):
+    source: EnumProperty(
+        name="动作来源",
+        items=[("BLENDER", "Blender 动作", "按 Blender 里当前的动作烘焙（包括手 K 的修改、IK、约束）"),
+               ("VMD", "VMD 文件", "按原始 VMD 文件烘焙（更快，但看不到 Blender 里的修改）")],
+        default="BLENDER")
     auto_offset: BoolProperty(name="自动对齐帧", default=True,
                               description="按骨架现有动作的起始帧对齐；没有动作时用当前帧")
     frame_offset: IntProperty(name="帧偏移", default=0,
@@ -321,9 +330,10 @@ class CheryMMDBakeSettings(bpy.types.PropertyGroup):
     substeps: IntProperty(name="最大子步", default=10, min=1, max=100)
     threads: IntProperty(name="物理线程数", default=0, min=0, max=64,
                          description="0 = 自动（最多 8 线程，更多反而更慢）；1 = 单线程，结果和旧版完全一致")
-    use_range: BoolProperty(name="指定帧范围", default=False)
-    start: IntProperty(name="起始(VMD帧)", default=0, min=0)
-    end: IntProperty(name="结束(VMD帧)", default=1000, min=0)
+    use_range: BoolProperty(name="指定帧范围", default=False,
+                            description="Blender 动作：默认用场景帧范围；VMD：默认用整个 VMD")
+    start: IntProperty(name="起始帧", default=0, min=0)
+    end: IntProperty(name="结束帧", default=1000, min=0)
     clean_rig: BoolProperty(name="清除 MMD Tools 物理", default=True,
                             description="若模型已 Build 物理，先 Clean，否则刚体会覆盖烘焙结果")
     keep_mbk: BoolProperty(name="保留中间文件", default=False)
@@ -387,11 +397,16 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
             context.workspace.status_text_set(None)
         except Exception:
             pass
-        if not self._settings.keep_mbk and self._out and os.path.isfile(self._out):
-            try:
-                os.remove(self._out)
-            except OSError:
-                pass
+        if self._sampler is not None:
+            self._sampler.close()   # restores modifiers / rigid body world / current frame
+            self._sampler = None
+        if not self._settings.keep_mbk:
+            for f in (self._out, self._pose):
+                if f and os.path.isfile(f):
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
         _Job.running = False
         _Job.text = ""
         _redraw_ui()
@@ -410,53 +425,67 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
         return self.execute(context)
 
     def execute(self, context):
-        import threading
-
         self._timer = None
         self._proc = None
         self._out = None
+        self._pose = None
+        self._sampler = None
         s = self._settings = context.scene.chery_mmd_bake
         self._root, self._arm = find_armature(context)
         pmx, vmd = paths.autofill(self._root, self._arm)
         pmx = bpy.path.abspath(pmx) if pmx else ""
         vmd = bpy.path.abspath(vmd) if vmd else ""
+        from_blender = s.source == "BLENDER"
         if not os.path.isfile(EXE_PATH):
             self.report({"ERROR"}, f"找不到 {EXE_PATH}")
             return {"CANCELLED"}
         if not os.path.isfile(pmx):
             self.report({"ERROR"}, "没找到 PMX 模型文件，请在面板里手动选择")
             return {"CANCELLED"}
-        if not os.path.isfile(vmd):
+        if not from_blender and not os.path.isfile(vmd):
             self.report({"ERROR"}, "没找到 VMD 动作文件，请在面板里手动选择")
             return {"CANCELLED"}
 
-        self._out = os.path.join(tempfile.gettempdir(), f"mmdbake_{int(time.time())}.mbk")
-        args = [EXE_PATH, pmx, vmd, self._out,
+        stamp = int(time.time())
+        self._out = os.path.join(tempfile.gettempdir(), f"mmdbake_{stamp}.mbk")
+        args = [EXE_PATH, pmx, "-" if from_blender else vmd, self._out,
                 "--warmup", str(s.warmup), "--settle", str(s.settle),
                 "--fps", str(s.fps), "--substeps", str(s.substeps)]
         if s.threads > 0:
             args += ["--threads", str(s.threads)]
-        if s.use_range:
+        scene = context.scene
+        if from_blender:
+            # MMD Tools rigid bodies would fight the sampled pose: clean them first
+            root = self._root
+            if s.clean_rig and root is not None and getattr(root.mmd_root, "is_built", False):
+                try:
+                    with context.temp_override(active_object=root, object=root,
+                                               selected_objects=[root], selected_editable_objects=[root]):
+                        bpy.ops.mmd_tools.clean_rig()
+                except Exception as e:
+                    self.report({"WARNING"}, f"自动 Clean 物理失败，请手动点 MMD Tools 的 Clean：{e}")
+            f0, f1 = (s.start, max(s.start, s.end)) if s.use_range else (scene.frame_start, scene.frame_end)
+            self._pose = os.path.join(tempfile.gettempdir(), f"mmdbake_{stamp}.mbp")
+            scene_fps = scene.render.fps / (scene.render.fps_base or 1.0)
+            args += ["--pose", self._pose, "--dt", repr(1.0 / scene_fps)]
+            self._sampler = pose_input.sample_pose(scene, self._arm, f0, f1, self._pose)
+            self._sample_total = f1 - f0 + 1
+        elif s.use_range:
             args += ["--start", str(s.start), "--end", str(max(s.start, s.end))]
-
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        try:
-            self._proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                          creationflags=flags)
-        except OSError as e:
-            self.report({"ERROR"}, f"无法运行 mmdbake.exe：{e}")
-            return {"CANCELLED"}
+        self._args = args
 
         self._lines = []
         self._t0 = time.time()
+        self._t_sampled = self._t0
         self._t_bake_start = None
         self._t_sim_end = None
-        threading.Thread(target=self._reader, daemon=True).start()
         self._t_sim = 0.0
-        self._phase = "sim"
         self._gen = None
+        self._phase = "sample" if from_blender else "sim"
         _Job.running = True
         progress_hud.start()
+        if not from_blender and not self._start_proc():
+            return self._finish(context, cancelled=True, msg="无法运行烘焙程序")
 
         wm = context.window_manager
         wm.progress_begin(0, 1000)
@@ -464,6 +493,19 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
         wm.modal_handler_add(self)
         self._set(context, 0.0, "启动中")
         return {"RUNNING_MODAL"}
+
+    def _start_proc(self):
+        import threading
+
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            self._proc = subprocess.Popen(self._args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                          creationflags=flags)
+        except OSError as e:
+            self.report({"ERROR"}, f"无法运行 mmdbake.exe：{e}")
+            return False
+        threading.Thread(target=self._reader, daemon=True).start()
+        return True
 
     # ---- loop ----
     def modal(self, context, event):
@@ -473,6 +515,8 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
         if event.type != "TIMER":
             return {"PASS_THROUGH"}
         try:
+            if self._phase == "sample":
+                return self._tick_sample(context)
             if self._phase == "sim":
                 return self._tick_sim(context)
             return self._tick_write(context)
@@ -480,20 +524,37 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
             self.report({"ERROR"}, f"写入关键帧失败：{e}")
             return self._finish(context, cancelled=True, msg="写入关键帧失败")
 
+    # reading the action from Blender (Blender source only), part of the "预热" phase
+    def _tick_sample(self, context):
+        deadline = time.time() + 0.05
+        while time.time() < deadline:
+            kind, a, b = next(self._sampler)
+            if kind == "sample":
+                self._set(context, 0.05 * a / max(1, b), f"读取 Blender 动作 {a}/{b} 帧", 0, 0.5 * a / max(1, b))
+            elif kind == "sampled":
+                self._sampler = None
+                self._t_sampled = time.time()
+                if not self._start_proc():
+                    return self._finish(context, cancelled=True, msg="无法运行烘焙程序")
+                self._phase = "sim"
+                return {"RUNNING_MODAL"}
+        return {"RUNNING_MODAL"}
+
     # physics simulation (external process): 0% .. 70%
     def _tick_sim(self, context):
         last = self._lines[-1] if self._lines else ""
         elapsed = time.time() - self._t0
         if last.startswith("WARMUP "):
             a, b = last.split()[1].split("/")
+            base = 0.5 if self._pose else 0.0
             self._set(context, 0.05 * int(a) / max(1, int(b)), f"物理预热 {a}/{b} 帧  {elapsed:.0f}s",
-                      0, int(a) / max(1, int(b)))
+                      0, base + (1 - base) * int(a) / max(1, int(b)))
         elif last.startswith("PROGRESS "):
             a, b = last.split()[1].split("/")
             self._set(context, 0.05 + 0.65 * int(a) / max(1, int(b)), f"物理计算 {a}/{b} 帧  {elapsed:.0f}s",
                       1, int(a) / max(1, int(b)))
         else:
-            self._set(context, _Job.factor, f"加载模型和动作  {elapsed:.0f}s", 0, 0.0)
+            self._set(context, _Job.factor, f"加载模型和动作  {elapsed:.0f}s", 0, 0.5 if self._pose else 0.0)
 
         rc = self._proc.poll()
         if rc is None:
@@ -518,7 +579,10 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
 
         self._set(context, 0.70, "读取烘焙结果", 2, 0.0)
         data = BakeData(self._out)
-        self._offset = detect_frame_offset(arm, context.scene) if s.auto_offset else s.frame_offset
+        if self._pose:
+            self._offset = 0
+        else:
+            self._offset = detect_frame_offset(arm, context.scene) if s.auto_offset else s.frame_offset
         self._gen = apply_bake(arm, data, self._offset, self.report)
         self._phase = "write"
         return {"RUNNING_MODAL"}
@@ -534,9 +598,11 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
                 self._set(context, 0.80 + 0.20 * a / max(1, b), f"写入关键帧 {a}/{b} 根骨骼",
                           2, 0.25 + 0.75 * a / max(1, b))
             elif kind == "done":
-                n, scale, f0, f1 = a
+                n, scale, f0, f1, muted = a
+                if muted:
+                    self.report({"INFO"}, f"原动作里有 {muted} 条物理骨骼的通道，已静音（删除物理层时会恢复）")
                 s = self._settings
-                if s.auto_offset:
+                if s.auto_offset and not self._pose:
                     s.frame_offset = self._offset
                 context.view_layer.update()
                 self._report_timing(n, f1 - f0 + 1, f0, f1, scale)
@@ -546,13 +612,16 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
     def _report_timing(self, bones, frames, f0, f1, scale):
         t_end = time.time()
         bake_start = self._t_bake_start or self._t_sim_end
-        prep = bake_start - self._t0
+        sample = self._t_sampled - self._t0
+        prep = bake_start - self._t_sampled
         bake = self._t_sim_end - bake_start
         imp = t_end - self._t_sim_end
         total = t_end - self._t0
-        _Job.last = dict(prep=prep, bake=bake, imp=imp, total=total, frames=frames, bones=bones)
+        _Job.last = dict(sample=sample, prep=prep, bake=bake, imp=imp, total=total, frames=frames, bones=bones,
+                         source="Blender 动作" if self._pose else "VMD")
         lines = [
-            "[CheryStage] MMD 物理烘焙完成",
+            "[CheryStage] MMD 物理烘焙完成（动作来源：" + _Job.last["source"] + "）",
+        ] + ([f"  读取动作：{_fmt_s(sample)}（从 Blender 逐帧读取 {frames} 帧姿势）"] if self._pose else []) + [
             f"  准备阶段：{_fmt_s(prep)}（加载模型与动作、物理预热）",
             f"  烘焙阶段：{_fmt_s(bake)}（{frames} 帧物理计算）",
             f"  导入阶段：{_fmt_s(imp)}（写入 {bones} 根物理骨骼的关键帧）",
@@ -562,7 +631,8 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
         for line in lines[1:]:                         # Info editor log
             self.report({"INFO"}, line.strip())
         # last report wins the status bar: keep it a one-line summary
-        self.report({"INFO"}, f"烘焙完成：准备 {_fmt_s(prep)} · 烘焙 {_fmt_s(bake)} · 导入 {_fmt_s(imp)} · 总计 {_fmt_s(total)}")
+        read = f"读取 {_fmt_s(sample)} · " if self._pose else ""
+        self.report({"INFO"}, f"烘焙完成：{read}准备 {_fmt_s(prep)} · 烘焙 {_fmt_s(bake)} · 导入 {_fmt_s(imp)} · 总计 {_fmt_s(total)}")
 
     def cancel(self, context):
         self._finish(context, cancelled=True)
@@ -595,19 +665,24 @@ class CHERY_PT_mmd_bake(bpy.types.Panel):
                 ad = arm.animation_data
                 act = ad.action.name if ad and ad.action else ""
                 _schedule_autofill(owner.name, act)
+            lay.prop(s, "source", expand=True)
             col = lay.column(align=True)
             col.prop(owner, "mmd_bake_pmx")
-            col.prop(owner, "mmd_bake_vmd")
-            if not owner.mmd_bake_vmd:
-                col.label(text="没检测到 VMD：先用 MMD Tools 导入动作，或手动选择", icon="INFO")
+            if s.source == "VMD":
+                col.prop(owner, "mmd_bake_vmd")
+                if not owner.mmd_bake_vmd:
+                    col.label(text="没检测到 VMD：先用 MMD Tools 导入动作，或手动选择", icon="INFO")
             col.operator(CHERY_OT_mmd_detect_paths.bl_idname, icon="VIEWZOOM")
 
         box = lay.box()
-        row = box.row()
-        row.prop(s, "auto_offset")
-        sub = row.row()
-        sub.enabled = not s.auto_offset
-        sub.prop(s, "frame_offset")
+        if s.source == "VMD":
+            row = box.row()
+            row.prop(s, "auto_offset")
+            sub = row.row()
+            sub.enabled = not s.auto_offset
+            sub.prop(s, "frame_offset")
+        elif not s.use_range:
+            box.label(text=f"帧范围：场景 {context.scene.frame_start} – {context.scene.frame_end}", icon="TIME")
         box.prop(s, "use_range")
         if s.use_range:
             r = box.row(align=True)
@@ -634,15 +709,79 @@ class CHERY_PT_mmd_bake(bpy.types.Panel):
             col.label(text="按 Esc 取消", icon="CANCEL")
         else:
             lay.operator(CHERY_OT_mmd_bake.bl_idname, icon="PHYSICS")
+            if arm is not None:
+                _draw_layers(lay, arm)
             if _Job.last:
                 L = _Job.last
                 box = lay.box()
                 box.label(text=f"上次烘焙：{L['frames']} 帧 · {L['bones']} 根骨骼", icon="TIME")
                 col = box.column(align=True)
+                if L.get("sample"):
+                    col.label(text=f"读取动作　{_fmt_s(L['sample'])}")
                 col.label(text=f"准备阶段　{_fmt_s(L['prep'])}")
                 col.label(text=f"烘焙阶段　{_fmt_s(L['bake'])}")
                 col.label(text=f"导入阶段　{_fmt_s(L['imp'])}")
                 col.label(text=f"总计　　　{_fmt_s(L['total'])}")
+
+
+def _draw_layers(lay, arm):
+    box = lay.box()
+    box.label(text="动画层", icon="NLA")
+    tr = layers.find_track(arm)
+    row = box.row(align=True)
+    if tr is None:
+        row.label(text="物理层：尚未烘焙", icon="PHYSICS")
+    else:
+        on = not tr.mute
+        op = row.operator(CHERY_OT_mmd_layer_toggle.bl_idname, text="", icon="CHECKBOX_HLT" if on else "CHECKBOX_DEHLT", emboss=False)
+        act = layers.physics_action(arm)
+        row.label(text=f"物理层  {act.name if act else ''}", icon="PHYSICS")
+        row.operator(CHERY_OT_mmd_layer_delete.bl_idname, text="", icon="TRASH")
+    row = box.row(align=True)
+    mot = layers.motion_action(arm)
+    row.label(text="", icon="CHECKBOX_HLT")
+    row.label(text=f"动作层  {mot.name if mot else '（无）'}", icon="ACTION")
+    n = layers.muted_count(arm)
+    if n and tr is not None and not tr.mute:
+        box.label(text=f"动作层里 {n} 条物理骨骼通道已静音", icon="INFO")
+
+
+class CHERY_OT_mmd_layer_toggle(bpy.types.Operator):
+    bl_idname = "chery.mmd_layer_toggle"
+    bl_label = "开关物理层"
+    bl_description = "打开或关闭物理层（关闭后裙子等物理骨骼回到原动作 / 静止姿势）"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        arm = find_armature(context)[1]
+        return arm is not None and layers.find_track(arm) is not None
+
+    def execute(self, context):
+        arm = find_armature(context)[1]
+        tr = layers.find_track(arm)
+        layers.set_physics_enabled(arm, tr.mute)
+        return {"FINISHED"}
+
+
+class CHERY_OT_mmd_layer_delete(bpy.types.Operator):
+    bl_idname = "chery.mmd_layer_delete"
+    bl_label = "删除物理层"
+    bl_description = "删除物理层（NLA 轨道和烘焙的物理动作），并恢复原动作里被静音的通道"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        arm = find_armature(context)[1]
+        return arm is not None and layers.find_track(arm) is not None
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        layers.delete_physics_layer(find_armature(context)[1])
+        self.report({"INFO"}, "已删除物理层")
+        return {"FINISHED"}
 
 
 _autofill_tried = set()
@@ -692,7 +831,8 @@ class CHERY_OT_mmd_detect_paths(bpy.types.Operator):
         return {"FINISHED"}
 
 
-classes = (CheryMMDBakeSettings, CHERY_OT_mmd_bake, CHERY_OT_mmd_detect_paths, CHERY_PT_mmd_bake)
+classes = (CheryMMDBakeSettings, CHERY_OT_mmd_bake, CHERY_OT_mmd_detect_paths,
+           CHERY_OT_mmd_layer_toggle, CHERY_OT_mmd_layer_delete, CHERY_PT_mmd_bake)
 
 
 def register():
