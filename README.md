@@ -74,11 +74,13 @@ CheryStage（前身 CheryTools）是一个面向 MMD 动画制作的 Blender 扩
 需要：Git、CMake、Ninja、MinGW-w64 g++（例如 [WinLibs](https://winlibs.com/)）、Python 3。
 
 ```bash
-git clone --recursive https://github.com/CherySui/CheryStage.git
+git clone https://github.com/CherySui/CheryStage.git
 cd CheryStage
 python tools/build.py   # 拉取子模块、打补丁、编译 mmdbake.exe 并放进插件
 python tools/pack.py    # 打包成 dist/CheryStage_vX.Y.Z.zip
 ```
+
+> 不要用 `git clone --recursive`：它会顺带拉取 saba 自带的查看器依赖（glslang 等），既用不到又很大。`tools/build.py` 只会拉取 saba 和 Bullet 本身（浅克隆，固定到经过测试的版本）。
 
 ### 目录结构
 
