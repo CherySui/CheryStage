@@ -1,0 +1,103 @@
+diff --git a/src/Saba/Model/MMD/MMDPhysics.cpp b/src/Saba/Model/MMD/MMDPhysics.cpp
+index 4b1d5d9..e86300f 100644
+--- a/src/Saba/Model/MMD/MMDPhysics.cpp
++++ b/src/Saba/Model/MMD/MMDPhysics.cpp
+@@ -14,6 +14,22 @@
+ #include <btBulletCollisionCommon.h>
+ #include <btBulletDynamicsCommon.h>
+ 
++// mmdbake: optional multithreaded world (needs BT_THREADSAFE=1)
++#if BT_THREADSAFE
++#include <BulletCollision/CollisionDispatch/btCollisionDispatcherMt.h>
++#include <BulletDynamics/Dynamics/btDiscreteDynamicsWorldMt.h>
++#include <BulletDynamics/ConstraintSolver/btSequentialImpulseConstraintSolverMt.h>
++#include <LinearMath/btThreads.h>
++#endif
++
++namespace saba
++{
++	// mmdbake: number of physics threads; <= 1 keeps the original single-threaded world
++	int g_mmdPhysicsThreads = 1;
++	// mmdbake: also parallelize inside large islands (changes solve order slightly)
++	bool g_mmdPhysicsSplitIslands = true;
++}
++
+ namespace saba
+ {
+ 	class MMDMotionState : public btMotionState
+@@ -68,16 +84,34 @@ namespace saba
+ 	{
+ 		m_broadphase = std::make_unique<btDbvtBroadphase>();
+ 		m_collisionConfig = std::make_unique<btDefaultCollisionConfiguration>();
+-		m_dispatcher = std::make_unique<btCollisionDispatcher>(m_collisionConfig.get());
++#if BT_THREADSAFE
++		if (g_mmdPhysicsThreads > 1 && btGetTaskScheduler() != nullptr)
++		{
++			m_dispatcher = std::make_unique<btCollisionDispatcherMt>(m_collisionConfig.get());
++			auto pool = std::make_unique<btConstraintSolverPoolMt>(g_mmdPhysicsThreads);
++			m_world = std::make_unique<btDiscreteDynamicsWorldMt>(
++				m_dispatcher.get(),
++				m_broadphase.get(),
++				pool.get(),
++				g_mmdPhysicsSplitIslands ? (m_solverMt = std::make_unique<btSequentialImpulseConstraintSolverMt>()).get() : nullptr,
++				m_collisionConfig.get()
++				);
++			m_solverPool = std::move(pool);
++		}
++		else
++#endif
++		{
++			m_dispatcher = std::make_unique<btCollisionDispatcher>(m_collisionConfig.get());
+ 
+-		m_solver = std::make_unique<btSequentialImpulseConstraintSolver>();
++			m_solver = std::make_unique<btSequentialImpulseConstraintSolver>();
+ 
+-		m_world = std::make_unique<btDiscreteDynamicsWorld>(
+-			m_dispatcher.get(),
+-			m_broadphase.get(),
+-			m_solver.get(),
+-			m_collisionConfig.get()
+-			);
++			m_world = std::make_unique<btDiscreteDynamicsWorld>(
++				m_dispatcher.get(),
++				m_broadphase.get(),
++				m_solver.get(),
++				m_collisionConfig.get()
++				);
++		}
+ 
+ 		m_world->setGravity(btVector3(0, -9.8f * 10.0f, 0));
+ 
+@@ -111,8 +145,10 @@ namespace saba
+ 		m_broadphase = nullptr;
+ 		m_collisionConfig = nullptr;
+ 		m_dispatcher = nullptr;
+-		m_solver = nullptr;
+ 		m_world = nullptr;
++		m_solver = nullptr;
++		m_solverPool = nullptr;
++		m_solverMt = nullptr;
+ 		m_groundShape = nullptr;
+ 		m_groundMS = nullptr;
+ 		m_groundRB = nullptr;
+diff --git a/src/Saba/Model/MMD/MMDPhysics.h b/src/Saba/Model/MMD/MMDPhysics.h
+index 85c54ae..f1d8e7c 100644
+--- a/src/Saba/Model/MMD/MMDPhysics.h
++++ b/src/Saba/Model/MMD/MMDPhysics.h
+@@ -25,6 +25,7 @@ class btBroadphaseInterface;
+ class btDefaultCollisionConfiguration;
+ class btCollisionDispatcher;
+ class btSequentialImpulseConstraintSolver;
++class btConstraintSolver;
+ class btMotionState;
+ struct btOverlapFilterCallback;
+ 
+@@ -133,6 +134,8 @@ namespace saba
+ 		std::unique_ptr<btDefaultCollisionConfiguration>	m_collisionConfig;
+ 		std::unique_ptr<btCollisionDispatcher>				m_dispatcher;
+ 		std::unique_ptr<btSequentialImpulseConstraintSolver>	m_solver;
++		std::unique_ptr<btConstraintSolver>			m_solverPool;	// mmdbake: multithreaded solver pool
++		std::unique_ptr<btConstraintSolver>			m_solverMt;	// mmdbake: solver for large islands
+ 		std::unique_ptr<btDiscreteDynamicsWorld>			m_world;
+ 		std::unique_ptr<btCollisionShape>					m_groundShape;
+ 		std::unique_ptr<btMotionState>						m_groundMS;

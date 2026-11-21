@@ -1,0 +1,10 @@
+[submodule "native/mmdbake/third_party/saba"]
+	path = native/mmdbake/third_party/saba
+	url = https://github.com/benikabocha/saba.git
+	shallow = true
+	ignore = dirty
+[submodule "native/mmdbake/third_party/bullet3"]
+	path = native/mmdbake/third_party/bullet3
+	url = https://github.com/bulletphysics/bullet3.git
+	shallow = true
+	ignore = dirty

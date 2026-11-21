@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Generated at runtime by the easing library
+chery_stage/easing/icons_cache/
+
+# Native build output (the add-on ships the exe via GitHub Releases)
+native/mmdbake/build*/
+chery_stage/mmd_bake/bin/*.exe
+
+# Packaged add-on
+dist/
+*.zip
+
+# Bake intermediates
+*.mbk

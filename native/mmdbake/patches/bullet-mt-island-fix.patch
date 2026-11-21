@@ -1,0 +1,22 @@
+diff --git a/src/BulletDynamics/Dynamics/btSimulationIslandManagerMt.cpp b/src/BulletDynamics/Dynamics/btSimulationIslandManagerMt.cpp
+index 5353fe0..10f147e 100644
+--- a/src/BulletDynamics/Dynamics/btSimulationIslandManagerMt.cpp
++++ b/src/BulletDynamics/Dynamics/btSimulationIslandManagerMt.cpp
+@@ -434,7 +434,7 @@ void btSimulationIslandManagerMt::addManifoldsToIslands(btDispatcher* dispatcher
+ 				// scatter manifolds into various islands
+ 				int islandId = getIslandId(manifold);
+ 				// if island not sleeping,
+-				if (Island* island = getIsland(islandId))
++				if (Island* island = (islandId >= 0) ? getIsland(islandId) : NULL)  // mmdbake: skip constraints/manifolds between non-dynamic bodies
+ 				{
+ 					island->manifoldArray.push_back(manifold);
+ 				}
+@@ -454,7 +454,7 @@ void btSimulationIslandManagerMt::addConstraintsToIslands(btAlignedObjectArray<b
+ 		{
+ 			int islandId = btGetConstraintIslandId1(constraint);
+ 			// if island is not sleeping,
+-			if (Island* island = getIsland(islandId))
++			if (Island* island = (islandId >= 0) ? getIsland(islandId) : NULL)  // mmdbake: skip constraints/manifolds between non-dynamic bodies
+ 			{
+ 				island->constraintArray.push_back(constraint);
+ 			}
