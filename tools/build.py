@@ -34,7 +34,8 @@ def run(cmd, cwd=None, check=True, quiet=False):
 
 
 def main():
-    run(["git", "submodule", "update", "--init", "--depth", "1"], cwd=ROOT)
+    # core.longpaths: Bullet's repo has example files whose paths exceed Windows' 260-char limit
+    run(["git", "-c", "core.longpaths=true", "submodule", "update", "--init", "--depth", "1"], cwd=ROOT)
 
     for sub, patch in PATCHES.items():
         repo = os.path.join(NATIVE, sub)
