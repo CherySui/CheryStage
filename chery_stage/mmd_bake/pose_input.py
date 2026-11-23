@@ -128,3 +128,140 @@ def sample_pose(scene, arm, frame_start, frame_end, path, chunk=8):
             if (i + 1) % chunk == 0:
                 yield ("sample", i + 1, nf)
     yield ("sampled", nf, None)
+
+
+# --------------------------------------------------------------------------- #
+# scene mode: several armatures + passive rigid body colliders, one pass
+# --------------------------------------------------------------------------- #
+COLLIDER_SHAPES = {"BOX": 0, "SPHERE": 1, "CAPSULE": 2, "CYLINDER": 3, "CONE": 4,
+                   "CONVEX_HULL": 5, "COMPOUND": 5, "MESH": 6}
+
+
+def _in_mmd_model(ob):
+    while ob is not None:
+        if getattr(ob, "mmd_type", "NONE") != "NONE":
+            return True
+        ob = ob.parent
+    return False
+
+
+def scene_colliders(scene):
+    """Objects set to Passive in Blender's rigid body panel (MMD Tools' own rigid bodies excluded)."""
+    out = []
+    for ob in scene.objects:
+        rb = ob.rigid_body
+        if rb is None or rb.type != "PASSIVE" or not rb.enabled or ob.type != "MESH":
+            continue
+        if _in_mmd_model(ob) or not ob.visible_get():
+            continue
+        out.append(ob)
+    return out
+
+
+def _rot_loc(m):
+    """(qw,qx,qy,qz,tx,ty,tz) of a world matrix with scale removed."""
+    loc, rot, _scale = m.decompose()
+    return (rot.w, rot.x, rot.y, rot.z, loc.x, loc.y, loc.z)
+
+
+def _collider_geometry(ob, depsgraph):
+    rb = ob.rigid_body
+    shape = COLLIDER_SHAPES.get(rb.collision_shape, 5)
+    sc = np.array(ob.matrix_world.to_scale(), dtype=np.float64)
+    bb = np.array([tuple(c) for c in ob.bound_box], dtype=np.float64) * sc
+    lo, hi = bb.min(0), bb.max(0)
+    dims, center = hi - lo, (hi + lo) * 0.5
+    if shape == 1:
+        size = (float(dims.max()) * 0.5, 0.0, 0.0)
+    elif shape in (2, 3, 4):
+        size = (float(max(dims[0], dims[1])) * 0.5, 0.0, float(dims[2]))
+    else:
+        size = tuple(float(x) for x in dims)
+    verts = np.zeros((0, 3), dtype=np.float32)
+    tris = np.zeros((0, 3), dtype=np.uint32)
+    if shape in (5, 6):
+        ev = ob.evaluated_get(depsgraph)
+        me = ev.to_mesh()
+        try:
+            co = np.empty(len(me.vertices) * 3, dtype=np.float32)
+            me.vertices.foreach_get("co", co)
+            verts = (co.reshape(-1, 3) * sc).astype(np.float32)
+            if shape == 6:
+                me.calc_loop_triangles()
+                t = np.empty(len(me.loop_triangles) * 3, dtype=np.int32)
+                me.loop_triangles.foreach_get("vertices", t)
+                tris = t.reshape(-1, 3).astype(np.uint32)
+        finally:
+            ev.to_mesh_clear()
+        center = np.zeros(3)
+    margin = float(rb.collision_margin) if rb.use_margin else 0.0
+    return shape, margin, size, tuple(float(x) for x in center), verts, tris
+
+
+def sample_scene(scene, arms, colliders, frame_start, frame_end, pose_paths, coll_path, chunk=8):
+    """Generator: one pass over the frames for every armature (pose file v2) and every collider.
+
+    Yields ("sample", done, total) every `chunk` frames, then ("sampled", total, None).
+    """
+    import contextlib
+
+    nf = frame_end - frame_start + 1
+    per = []
+    for arm in arms:
+        pbs = arm.pose.bones
+        bones = arm.data.bones
+        rest = np.stack([np.array(bones[pb.name].matrix_local, dtype=np.float64) for pb in pbs])
+        per.append(dict(
+            arm=arm, pbs=pbs, nb=len(pbs), names=[_mmd_name(pb) for pb in pbs], rest_inv=_rigid_inv(rest),
+            heads=np.array([tuple(bones[pb.name].head_local) for pb in pbs], dtype=np.float32),
+            buf=np.empty(len(pbs) * 16, dtype=np.float32), out=np.empty((len(pbs) + 1, 7), dtype=np.float32)))
+
+    with contextlib.ExitStack() as stack:
+        for d in per:
+            stack.enter_context(_Speedup(scene, d["arm"]))
+        files = [stack.enter_context(open(p, "wb")) for p in pose_paths]
+        cf = stack.enter_context(open(coll_path, "wb")) if coll_path else None
+
+        scene.frame_set(frame_start)
+        for f, d in zip(files, per):
+            f.write(b"MMDPOSE1")
+            f.write(struct.pack("<IIIi", 2, d["nb"], nf, frame_start))
+            for n, h in zip(d["names"], d["heads"]):
+                raw = n.encode("utf-8")
+                f.write(struct.pack("<I", len(raw)))
+                f.write(raw)
+                f.write(struct.pack("<3f", *h))
+        if cf:
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+            cf.write(b"MMDCOLL1")
+            cf.write(struct.pack("<IIIi", 1, len(colliders), nf, frame_start))
+            for ob in colliders:
+                shape, margin, size, center, verts, tris = _collider_geometry(ob, depsgraph)
+                raw = ob.name.encode("utf-8")
+                cf.write(struct.pack("<I", len(raw)))
+                cf.write(raw)
+                cf.write(struct.pack("<Bf3f3f", shape, margin, *size, *center))
+                cf.write(struct.pack("<I", len(verts)))
+                cf.write(verts.tobytes())
+                cf.write(struct.pack("<I", len(tris)))
+                cf.write(tris.tobytes())
+        cbuf = np.empty((len(colliders), 7), dtype=np.float32)
+
+        for i, fr in enumerate(range(frame_start, frame_end + 1)):
+            scene.frame_set(fr)
+            for f, d in zip(files, per):
+                d["pbs"].foreach_get("matrix", d["buf"])
+                pose = d["buf"].reshape(d["nb"], 4, 4).transpose(0, 2, 1).astype(np.float64)
+                s = pose @ d["rest_inv"]
+                out = d["out"]
+                out[0] = _rot_loc(d["arm"].matrix_world)
+                out[1:, 0:4] = _mat_to_quat(s[:, :3, :3])
+                out[1:, 4:7] = s[:, :3, 3]
+                f.write(out.tobytes())
+            if cf:
+                for k, ob in enumerate(colliders):
+                    cbuf[k] = _rot_loc(ob.matrix_world)
+                cf.write(cbuf.tobytes())
+            if (i + 1) % chunk == 0:
+                yield ("sample", i + 1, nf)
+    yield ("sampled", nf, None)

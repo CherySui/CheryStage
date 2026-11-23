@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "chery_stage"
-version = "1.6.0"
+version = "1.7.0"
 name = "CheryStage"
 tagline = "All-in-one MMD workflow: easing, physics bake, render export"
 maintainer = "Chery"

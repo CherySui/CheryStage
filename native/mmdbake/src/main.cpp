@@ -33,6 +33,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -61,13 +62,17 @@ static void Usage()
         "               [--pose file.mbp] [--dt seconds]\n");
 }
 
+int RunScene(const std::string& specPath, int warmup, int settle, float fps, int substeps, float dt);
+
 int wmain(int argc, wchar_t** argv)
 {
-    if (argc < 4) { Usage(); return 2; }
+    if (argc < 3) { Usage(); return 2; }
+    const bool sceneMode = ToUtf8(argv[1]) == "--scene";
+    if (!sceneMode && argc < 4) { Usage(); return 2; }
 
     std::string modelPath = ToUtf8(argv[1]);
     std::string vmdPath   = ToUtf8(argv[2]);
-    std::string outPath   = ToUtf8(argv[3]);
+    std::string outPath   = sceneMode ? std::string() : ToUtf8(argv[3]);
     int startFrame = 0, endFrame = -1, warmup = 60, settle = 60, substeps = 10;
     // more than ~8 threads only adds overhead for one model (measured)
     int threads = (int)std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
@@ -75,7 +80,7 @@ int wmain(int argc, wchar_t** argv)
     float dt = 1.0f / 30.0f;
     std::string posePath;
 
-    for (int i = 4; i < argc; i++)
+    for (int i = sceneMode ? 3 : 4; i < argc; i++)
     {
         std::string a = ToUtf8(argv[i]);
         auto next = [&](void) -> std::string {
@@ -92,6 +97,26 @@ int wmain(int argc, wchar_t** argv)
         else if (a == "--pose") posePath = next();
         else if (a == "--dt") dt = std::stof(next());
         else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); Usage(); return 2; }
+    }
+
+    if (sceneMode)
+    {
+        // Multithreaded Bullet world (must be set up before the models create their physics).
+        if (threads > 1)
+        {
+            threads = std::min(threads, (int)BT_MAX_THREAD_COUNT);
+            if (btITaskScheduler* ts = btCreateDefaultTaskScheduler())
+            {
+                ts->setNumThreads(threads);
+                btSetTaskScheduler(ts);
+                saba::g_mmdPhysicsThreads = ts->getNumThreads();
+            }
+        }
+        std::printf("physics threads: %d\n", std::max(1, saba::g_mmdPhysicsThreads));
+        int rc = RunScene(vmdPath /* = spec file */, warmup, settle, fps, substeps, dt);
+        // Rigid bodies were moved between worlds: skip teardown, all output is already on disk.
+        std::fflush(stdout); std::fflush(stderr);
+        std::_Exit(rc);
     }
 
     auto t0 = std::chrono::steady_clock::now();
