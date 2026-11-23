@@ -94,10 +94,11 @@ class _Speedup:
         return False
 
 
-def sample_pose(scene, arm, frame_start, frame_end, path, chunk=8):
+def sample_pose(scene, arm, frame_start, frame_end, path, chunk=8, fields=None):
     """Generator: samples frames [frame_start, frame_end] into `path`.
 
     Yields ("sample", done, total) every `chunk` frames, then ("sampled", total, None).
+    fields: optional FieldWriter, sampled on the same frames.
     """
     pbs = arm.pose.bones
     bones = arm.data.bones
@@ -126,9 +127,15 @@ def sample_pose(scene, arm, frame_start, frame_end, path, chunk=8):
             out[:, 0:4] = _mat_to_quat(s[:, :3, :3])
             out[:, 4:7] = s[:, :3, 3]
             f.write(out.tobytes())
+            if fields is not None:
+                fields.frame()
             if (i + 1) % chunk == 0:
                 f.flush()   # mmdbake reads the file while it is being written
+                if fields is not None:
+                    fields.flush()
                 yield ("sample", i + 1, nf)
+    if fields is not None:
+        fields.close()
     yield ("sampled", nf, None)
 
 
@@ -200,7 +207,7 @@ def _collider_geometry(ob, depsgraph):
     return shape, margin, size, tuple(float(x) for x in center), verts, tris
 
 
-def sample_scene(scene, arms, colliders, frame_start, frame_end, pose_paths, coll_path, chunk=8):
+def sample_scene(scene, arms, colliders, frame_start, frame_end, pose_paths, coll_path, chunk=8, fields=None):
     """Generator: one pass over the frames for every armature (pose file v2) and every collider.
 
     Yields ("sample", done, total) every `chunk` frames, then ("sampled", total, None).
@@ -264,10 +271,90 @@ def sample_scene(scene, arms, colliders, frame_start, frame_end, pose_paths, col
                 for k, ob in enumerate(colliders):
                     cbuf[k] = _rot_loc(ob.matrix_world)
                 cf.write(cbuf.tobytes())
+            if fields is not None:
+                fields.frame()
             if (i + 1) % chunk == 0:
                 for f in files:
                     f.flush()   # mmdbake reads the files while they are being written
                 if cf:
                     cf.flush()
+                if fields is not None:
+                    fields.flush()
                 yield ("sample", i + 1, nf)
+    if fields is not None:
+        fields.close()
     yield ("sampled", nf, None)
+
+
+# --------------------------------------------------------------------------- #
+# force fields (wind, force, vortex, turbulence) -> .mbf for mmdbake
+# --------------------------------------------------------------------------- #
+FIELD_TYPES = {"WIND": 0, "FORCE": 1, "VORTEX": 2, "TURBULENCE": 3}
+
+
+def scene_fields(scene):
+    """Force fields that act on rigid bodies: visible, supported type, in the rigid body world's
+    effector collection if one is set."""
+    rbw = scene.rigidbody_world
+    coll = rbw.effector_weights.collection if rbw is not None else None
+    allowed = set(coll.all_objects) if coll is not None else None
+    out = []
+    for ob in scene.objects:
+        fd = ob.field
+        if fd is None or fd.type not in FIELD_TYPES or not ob.visible_get():
+            continue
+        if allowed is not None and ob not in allowed:
+            continue
+        out.append(ob)
+    return out
+
+
+class FieldWriter:
+    """Writes the .mbf file: static field settings, then one record per sampled frame.
+
+    space: armature whose object space the fields are written in (single mode), or None for world.
+    """
+
+    def __init__(self, scene, fields, path, frames, first, space=None, mult=1.0):
+        self.fields, self.space = fields, space
+        rbw = scene.rigidbody_world
+        ew = rbw.effector_weights if rbw is not None else None
+        self.weights = [mult * (ew.all * getattr(ew, ob.field.type.lower(), 1.0) if ew else 1.0) for ob in fields]
+        self.f = open(path, "wb")
+        self.f.write(b"MMDFILD1")
+        self.f.write(struct.pack("<IIIi", 1, len(fields), frames, first))
+        for ob in fields:
+            fd = ob.field
+            flags = ((1 if fd.use_min_distance else 0) | (2 if fd.use_max_distance else 0)
+                     | (4 if fd.use_radial_min else 0) | (8 if fd.use_radial_max else 0)
+                     | (16 if fd.use_global_coords else 0))
+            zdir = {"POSITIVE": 1, "NEGATIVE": -1}.get(fd.z_direction, 0)
+            self.f.write(struct.pack("<BBBbB", FIELD_TYPES[fd.type], 1 if fd.shape == "PLANE" else 0,
+                                     {"TUBE": 1, "CONE": 2}.get(fd.falloff_type, 0), zdir, flags))
+            self.f.write(struct.pack("<8f", fd.falloff_power, fd.distance_min, fd.distance_max,
+                                     fd.radial_falloff, fd.radial_min, fd.radial_max, fd.size,
+                                     fd.inflow if fd.type == "VORTEX" else 0.0))
+        self.buf = np.empty((len(fields), 8), dtype=np.float32)
+
+    def frame(self):
+        inv = self.space.matrix_world.inverted() if self.space is not None else None
+        for k, ob in enumerate(self.fields):
+            m = ob.matrix_world if inv is None else inv @ ob.matrix_world
+            self.buf[k, :7] = _rot_loc(m)
+            self.buf[k, 7] = ob.field.strength * self.weights[k]
+        self.f.write(self.buf.tobytes())
+
+    def flush(self):
+        self.f.flush()
+
+    def close(self):
+        if self.f is not None:
+            self.f.close()
+            self.f = None
+
+
+def write_static_fields(scene, fields, path, space=None, mult=1.0):
+    """Fields as they are on the current frame (VMD input: nothing is sampled per frame)."""
+    w = FieldWriter(scene, fields, path, 1, scene.frame_current, space, mult)
+    w.frame()
+    w.close()

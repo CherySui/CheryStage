@@ -295,6 +295,7 @@ def apply_bake(arm, data, frame_offset, report):
 
 
     # physics goes to its own NLA layer; the motion action is never modified
+    layers.exit_tweak(arm)   # strips cannot change while a layer is being edited
     act, slot, cb = layers.prepare_physics_action(arm)
     for j, n in enumerate(targets):
         if j % 4 == 0:
@@ -359,6 +360,11 @@ class CheryMMDBakeSettings(bpy.types.PropertyGroup):
     clean_rig: BoolProperty(name="清除 MMD Tools 物理", default=True,
                             description="若模型已 Build 物理，先 Clean，否则刚体会覆盖烘焙结果")
     keep_mbk: BoolProperty(name="保留中间文件", default=False)
+    use_fields: BoolProperty(name="力场", default=True,
+                             description="场景里的力场（风、力、涡流、湍流）作用于物理刚体；"
+                                         "刚体世界的效果器权重同样生效")
+    field_strength: FloatProperty(name="力场强度", default=1.0, min=0.0, soft_max=10.0,
+                                  description="所有力场的强度倍率（1 = 按 Blender 中设置的强度）")
 
 
 class _Job:
@@ -426,6 +432,9 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
         if self._sampler is not None:
             self._sampler.close()   # restores modifiers / rigid body world / current frame
             self._sampler = None
+        if self._fields is not None:
+            self._fields.close()
+            self._fields = None
         if not self._settings.keep_mbk:
             for f in [self._out, self._pose] + list(self._tmp):
                 if f and os.path.isfile(f):
@@ -493,6 +502,11 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
         lines = [f"model\t{pm}\t{po}\t{ou}" for pm, po, ou in zip(pmxs, poses, outs)]
         if coll:
             lines.append(f"colliders\t{coll}")
+        fobs = pose_input.scene_fields(scene) if s.use_fields else []
+        fpath = os.path.join(tmp, f"mmdbake_{stamp}.mbf") if fobs else None
+        if fpath:
+            lines.append(f"fields\t{fpath}")
+            self._fields = pose_input.FieldWriter(scene, fobs, fpath, f1 - f0 + 1, f0, None, s.field_strength)
         lines.append(f"inter_model\t{1 if s.inter_model else 0}")
         lines.append(f"ground\t{1 if s.use_ground else 0}")
         with open(spec, "w", encoding="utf-8") as fh:
@@ -500,13 +514,14 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
         scene_fps = scene.render.fps / (scene.render.fps_base or 1.0)
         self._args = [EXE_PATH, "--scene", spec] + self._common_args(s) + [
             "--dt", repr(1.0 / scene_fps), "--stream", str(os.getpid())]
-        self._tmp = poses + outs + [spec] + ([coll] if coll else [])
+        self._tmp = poses + outs + [spec] + ([coll] if coll else []) + ([fpath] if fpath else [])
         self._scene_arms = [a for _r, a in models]
         self._scene_outs = outs
         self._pose = poses[0]          # "from Blender" flag for offsets / timing
-        self._sampler = pose_input.sample_scene(scene, self._scene_arms, colliders, f0, f1, poses, coll)
+        self._sampler = pose_input.sample_scene(scene, self._scene_arms, colliders, f0, f1, poses, coll,
+                                                fields=self._fields)
         self._sample_total = f1 - f0 + 1
-        self.report({"INFO"}, f"场景烘焙：{len(models)} 个模型，{len(colliders)} 个碰撞体")
+        self.report({"INFO"}, f"场景烘焙：{len(models)} 个模型，{len(colliders)} 个碰撞体，{len(fobs)} 个力场")
         return True
 
     def _apply_scene(self):
@@ -530,6 +545,7 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
         self._out = None
         self._pose = None
         self._sampler = None
+        self._fields = None
         self._tmp = []
         self._scene_arms = None
         s = self._settings = context.scene.chery_mmd_bake
@@ -564,15 +580,24 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
         if s.threads > 0:
             args += ["--threads", str(s.threads)]
         scene = context.scene
+        f0, f1 = (s.start, max(s.start, s.end)) if s.use_range else (scene.frame_start, scene.frame_end)
+        fobs = pose_input.scene_fields(scene) if s.use_fields else []
+        if fobs:
+            fpath = os.path.join(tempfile.gettempdir(), f"mmdbake_{stamp}.mbf")
+            args += ["--fields", fpath]
+            self._tmp.append(fpath)
+            if from_blender:   # sampled with the pose, frame by frame
+                self._fields = pose_input.FieldWriter(scene, fobs, fpath, f1 - f0 + 1, f0, self._arm, s.field_strength)
+            else:              # VMD: nothing is sampled per frame, fields as on the current frame
+                pose_input.write_static_fields(scene, fobs, fpath, self._arm, s.field_strength)
         if from_blender:
             # MMD Tools rigid bodies would fight the sampled pose: clean them first
             self._clean_rig(context, self._root)
-            f0, f1 = (s.start, max(s.start, s.end)) if s.use_range else (scene.frame_start, scene.frame_end)
             self._pose = os.path.join(tempfile.gettempdir(), f"mmdbake_{stamp}.mbp")
             scene_fps = scene.render.fps / (scene.render.fps_base or 1.0)
             # --stream: mmdbake starts while the poses are still being read and follows the file
             args += ["--pose", self._pose, "--dt", repr(1.0 / scene_fps), "--stream", str(os.getpid())]
-            self._sampler = pose_input.sample_pose(scene, self._arm, f0, f1, self._pose)
+            self._sampler = pose_input.sample_pose(scene, self._arm, f0, f1, self._pose, fields=self._fields)
             self._sample_total = f1 - f0 + 1
         elif s.use_range:
             args += ["--start", str(s.start), "--end", str(max(s.start, s.end))]
@@ -852,6 +877,7 @@ class CHERY_PT_mmd_bake(bpy.types.Panel):
             if not owner.mmd_bake_vmd:
                 col.label(text="没检测到 VMD：先用 MMD Tools 导入动作，或手动选择", icon="INFO")
         col.operator(CHERY_OT_mmd_detect_paths.bl_idname, icon="VIEWZOOM")
+        _draw_fields(context, lay, s, vmd=s.source == "VMD")
         self._draw_range(context, lay, s, True)
         lay.operator(CHERY_OT_mmd_bake.bl_idname, icon="PHYSICS").scene_mode = False
         _draw_layers(lay, arm)
@@ -885,6 +911,7 @@ class CHERY_PT_mmd_bake(bpy.types.Panel):
             box.label(text=f"{ob.name}　{ob.rigid_body.collision_shape}")
         if len(cols) > 12:
             box.label(text=f"…… 还有 {len(cols) - 12} 个")
+        _draw_fields(context, lay, s)
         box = lay.box()
         box.prop(s, "inter_model")
         box.prop(s, "use_ground")
@@ -905,12 +932,56 @@ class CHERY_PT_mmd_bake(bpy.types.Panel):
         box = lay.box()
         box.label(text="其他", icon="PREFERENCES")
         box.prop(s, "clean_rig")
-        box.prop(s, "keep_mbk")
+        if s.keep_mbk:   # debug option, set from Python; shown only so it can be switched off again
+            box.prop(s, "keep_mbk")
+            box.label(text="中间文件保存在 %TEMP%\\mmdbake_*，不会自动删除", icon="INFO")
+
+def _draw_fields(context, lay, s, vmd=False):
+    obs = pose_input.scene_fields(context.scene)
+    box = lay.box()
+    row = box.row(align=True)
+    row.prop(s, "use_fields", text=f"力场（{len(obs)}）", icon="FORCE_WIND")
+    if not obs:
+        box.label(text="添加 → 力场（风 / 力 / 涡流 / 湍流）即可作用于物理", icon="INFO")
+        return
+    if not s.use_fields:
+        return
+    row.prop(s, "field_strength", text="强度")
+    for ob in obs[:6]:
+        box.label(text=f"{ob.name}　{ob.field.type}  {ob.field.strength:g}")
+    if len(obs) > 6:
+        box.label(text=f"…… 还有 {len(obs) - 6} 个")
+    if vmd:
+        box.label(text="VMD 模式下力场固定为当前帧的状态（不随动画变化）", icon="INFO")
+
+
+def _draw_adjust(box, arm, has_physics):
+    atr = layers.find_adjust_track(arm)
+    row = box.row(align=True)
+    if atr is None:
+        if not has_physics:
+            return
+        sub = row.row(align=True)
+        sub.operator(CHERY_OT_mmd_adjust.bl_idname, text="新建调整层", icon="ADD").mode = "CREATE"
+        return
+    editing = layers.is_editing_adjust(arm)
+    on = not atr.mute
+    row.operator(CHERY_OT_mmd_adjust.bl_idname, text="", emboss=False,
+                 icon="CHECKBOX_HLT" if on else "CHECKBOX_DEHLT").mode = "TOGGLE"
+    row.label(text=f"调整层  {layers.adjust_key_count(arm)} 个关键帧", icon="GREASEPENCIL")
+    row.operator(CHERY_OT_mmd_adjust_delete.bl_idname, text="", icon="TRASH")
+    if editing:
+        box.operator(CHERY_OT_mmd_adjust.bl_idname, text="完成编辑", icon="CHECKMARK", depress=True).mode = "DONE"
+        box.label(text="在姿态模式下给物理骨骼 K 帧，只记录相对物理的偏移", icon="INFO")
+    else:
+        box.operator(CHERY_OT_mmd_adjust.bl_idname, text="编辑调整层", icon="KEYINGSET").mode = "EDIT"
+
 
 def _draw_layers(lay, arm):
     box = lay.box()
     box.label(text="动画层", icon="NLA")
     tr = layers.find_track(arm)
+    _draw_adjust(box, arm, tr is not None)
     row = box.row(align=True)
     if tr is None:
         row.label(text="物理层：尚未烘焙", icon="PHYSICS")
@@ -966,6 +1037,88 @@ class CHERY_OT_mmd_layer_delete(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class CHERY_OT_mmd_adjust(bpy.types.Operator):
+    bl_idname = "chery.mmd_adjust"
+    bl_label = "调整层"
+    bl_description = "在物理层上方的调整层里 K 帧修正物理效果"
+    bl_options = {"REGISTER", "UNDO"}
+
+    mode: EnumProperty(items=[("CREATE", "新建", "在物理层上方新建调整层"),
+                              ("EDIT", "编辑", "进入调整层编辑：K 的帧写进调整层，物理层不变"),
+                              ("DONE", "完成", "退出调整层编辑"),
+                              ("TOGGLE", "开关", "打开或关闭调整层")],
+                       options={"HIDDEN", "SKIP_SAVE"})
+
+    @classmethod
+    def description(cls, context, props):
+        return {"CREATE": "在物理层上方新建调整层：少量关键帧修正物理效果，不用改逐帧的物理关键帧",
+                "EDIT": "进入调整层编辑：之后 K 的帧写进调整层（时间线上只显示调整层的关键帧）",
+                "DONE": "退出调整层编辑，回到原来的动作",
+                "TOGGLE": "打开或关闭调整层"}.get(props.mode, cls.bl_description)
+
+    @classmethod
+    def poll(cls, context):
+        return find_armature(context)[1] is not None and not _Job.running
+
+    def execute(self, context):
+        arm = find_armature(context)[1]
+        if self.mode == "CREATE":
+            if layers.find_track(arm) is None:
+                self.report({"ERROR"}, "先烘焙物理，再新建调整层")
+                return {"CANCELLED"}
+            layers.build_adjust_track(arm)
+            self.mode = "EDIT"
+        if self.mode == "EDIT":
+            if not layers.edit_adjust_layer(arm, True):
+                self.report({"ERROR"}, "无法进入调整层编辑（NLA 中是否有其他层正在编辑？）")
+                return {"CANCELLED"}
+            self._pose_mode(context, arm)
+            self.report({"INFO"}, "正在编辑调整层：给物理骨骼 K 帧即可")
+        elif self.mode == "DONE":
+            layers.edit_adjust_layer(arm, False)
+        elif self.mode == "TOGGLE":
+            tr = layers.find_adjust_track(arm)
+            if tr is not None:
+                layers.set_adjust_enabled(arm, tr.mute)
+        _redraw_ui()
+        return {"FINISHED"}
+
+    @staticmethod
+    def _pose_mode(context, arm):
+        if context.mode == "POSE" and context.active_object == arm:
+            return
+        try:
+            if context.mode != "OBJECT":
+                bpy.ops.object.mode_set(mode="OBJECT")
+            for o in context.selected_objects:
+                o.select_set(False)
+            arm.select_set(True)
+            context.view_layer.objects.active = arm
+            bpy.ops.object.mode_set(mode="POSE")
+        except Exception:
+            pass
+
+
+class CHERY_OT_mmd_adjust_delete(bpy.types.Operator):
+    bl_idname = "chery.mmd_adjust_delete"
+    bl_label = "删除调整层"
+    bl_description = "删除调整层和其中的所有关键帧，物理层不受影响"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context):
+        arm = find_armature(context)[1]
+        return arm is not None and layers.find_adjust_track(arm) is not None
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, context):
+        layers.delete_adjust_layer(find_armature(context)[1])
+        self.report({"INFO"}, "已删除调整层")
+        return {"FINISHED"}
+
+
 _autofill_tried = set()
 
 
@@ -1014,7 +1167,8 @@ class CHERY_OT_mmd_detect_paths(bpy.types.Operator):
 
 
 classes = (CheryMMDBakeSettings, CHERY_OT_mmd_bake, CHERY_OT_mmd_detect_paths,
-           CHERY_OT_mmd_layer_toggle, CHERY_OT_mmd_layer_delete, CHERY_PT_mmd_bake)
+           CHERY_OT_mmd_layer_toggle, CHERY_OT_mmd_layer_delete, CHERY_OT_mmd_adjust,
+           CHERY_OT_mmd_adjust_delete, CHERY_PT_mmd_bake)
 
 
 def register():

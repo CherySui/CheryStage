@@ -5,6 +5,7 @@
 // spec.txt (UTF-8, one item per line, fields separated by TAB):
 //   model      <model.pmx> <pose.mbp> <out.mbk>      (one line per model, pose file version 2)
 //   colliders  <file.mbc>                             (optional)
+//   fields     <file.mbf>                             (optional, Blender world; see fields.h)
 //   inter_model 0|1                                   (collide rigid bodies of different models, default 0)
 //   ground     0|1                                    (saba's infinite ground plane at Blender z=0, default 1)
 //
@@ -49,6 +50,7 @@
 #include <vector>
 
 #include "stream_io.h"
+#include "fields.h"
 
 namespace
 {
@@ -309,7 +311,7 @@ namespace
     }
 }
 
-int RunScene(const std::string& specPath, int warmup, int settle, float fps, int substeps, float dt)
+int RunScene(const std::string& specPath, int warmup, int settle, float fps, int substeps, float dt, const std::string& fieldsArg)
 {
     using clk = std::chrono::steady_clock;
     auto t0 = clk::now();
@@ -318,7 +320,7 @@ int RunScene(const std::string& specPath, int warmup, int settle, float fps, int
 
     // ---- spec ----
     std::vector<SModel> models;
-    std::string collPath;
+    std::string collPath, fieldsPath = fieldsArg;
     bool interModel = false, ground = true;
     {
         FILE* f = OpenW(specPath, L"rb");
@@ -335,6 +337,7 @@ int RunScene(const std::string& specPath, int warmup, int settle, float fps, int
             if (fld.empty()) continue;
             if (fld[0] == "model" && fld.size() >= 4) { SModel m; m.pmxPath = fld[1]; m.posePath = fld[2]; m.outPath = fld[3]; models.push_back(std::move(m)); }
             else if (fld[0] == "colliders" && fld.size() >= 2) collPath = fld[1];
+            else if (fld[0] == "fields" && fld.size() >= 2) fieldsPath = fld[1];
             else if (fld[0] == "inter_model" && fld.size() >= 2) interModel = fld[1] == "1";
             else if (fld[0] == "ground" && fld.size() >= 2) ground = fld[1] == "1";
         }
@@ -427,6 +430,12 @@ int RunScene(const std::string& specPath, int warmup, int settle, float fps, int
         for (auto& c : colliders) world->addRigidBody(c.body.get(), (short)0x7FFF, (short)0x7FFF);
         cFrame.resize(cN * 7); cFirstFrame.resize(cN * 7);
     }
+    if (!fieldsPath.empty())
+    {
+        if (!fields::Load(fieldsPath, worldScale)) { std::fprintf(stderr, "ERROR: bad force field file: %s\n", fieldsPath.c_str()); return 1; }
+        fields::Install(world);
+        std::printf("force fields: %u\n", fields::Count());
+    }
     std::printf("scene: %zu models, %zu rigid bodies, %zu joints, %u colliders, inter-model %s, ground %s, scale %.5f\n",
         models.size(), rbCount, jointCount, cN, interModel ? "on" : "off", ground ? "on" : "off", worldScale);
     std::printf("frames: %d..%d (%u)\n", first, first + (int)nf - 1, nf);
@@ -494,6 +503,7 @@ int RunScene(const std::string& specPath, int warmup, int settle, float fps, int
             if (f == 0) cFrame = cFirstFrame;
             else if (streamio::Read(cFrame.data(), sizeof(float), cFrame.size(), cfp) != cFrame.size()) { std::fprintf(stderr, "ERROR: collider file truncated\n"); return 1; }
         }
+        if (!fields::SetFrame(f)) { std::fprintf(stderr, "ERROR: force field file truncated\n"); return 1; }
         step(false, 1.0f);
         for (auto& m : models) WriteFrame(m);
         int pct = (int)((f + 1) * 200LL / nf);

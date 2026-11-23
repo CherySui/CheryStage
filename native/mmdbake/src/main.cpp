@@ -13,6 +13,7 @@
 //   --fps F          physics internal step rate, Hz (default 120)
 //   --substeps N     max physics sub steps per frame (default 10)
 //   --threads N      physics worker threads (default: min(8, CPU cores), 1 = single-threaded)
+//   --fields F.mbf   Blender force fields (see fields.h), armature object space
 //
 // .mbk layout (little endian):
 //   char[8] "MMDBAKE1"; u32 version(=1); u32 boneCount; u32 frameCount; i32 firstFrame
@@ -46,6 +47,7 @@
 #include <unordered_map>
 #include <LinearMath/btThreads.h>
 #include "stream_io.h"
+#include "fields.h"
 
 namespace saba { extern int g_mmdPhysicsThreads; }
 
@@ -64,7 +66,7 @@ static void Usage()
         "               [--pose file.mbp] [--dt seconds] [--stream pid]\n");
 }
 
-int RunScene(const std::string& specPath, int warmup, int settle, float fps, int substeps, float dt);
+int RunScene(const std::string& specPath, int warmup, int settle, float fps, int substeps, float dt, const std::string& fieldsPath);
 
 int wmain(int argc, wchar_t** argv)
 {
@@ -80,7 +82,7 @@ int wmain(int argc, wchar_t** argv)
     int threads = (int)std::min(8u, std::max(1u, std::thread::hardware_concurrency()));
     float fps = 120.0f;
     float dt = 1.0f / 30.0f;
-    std::string posePath;
+    std::string posePath, fieldsPath;
 
     for (int i = sceneMode ? 3 : 4; i < argc; i++)
     {
@@ -99,6 +101,7 @@ int wmain(int argc, wchar_t** argv)
         else if (a == "--pose") posePath = next();
         else if (a == "--dt") dt = std::stof(next());
         else if (a == "--stream") streamio::Enable(std::stoul(next()));
+        else if (a == "--fields") fieldsPath = next();
         else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); Usage(); return 2; }
     }
 
@@ -116,7 +119,7 @@ int wmain(int argc, wchar_t** argv)
             }
         }
         std::printf("physics threads: %d\n", std::max(1, saba::g_mmdPhysicsThreads));
-        int rc = RunScene(vmdPath /* = spec file */, warmup, settle, fps, substeps, dt);
+        int rc = RunScene(vmdPath /* = spec file */, warmup, settle, fps, substeps, dt, fieldsPath);
         // Rigid bodies were moved between worlds: skip teardown, all output is already on disk.
         std::fflush(stdout); std::fflush(stderr);
         std::_Exit(rc);
@@ -363,6 +366,15 @@ int wmain(int argc, wchar_t** argv)
         return streamio::Read(dst.data(), sizeof(float), dst.size(), pfp) == dst.size();
     };
 
+    // Force fields: VMD input has no Blender pose to measure the scale, MMD Tools imports at 0.08
+    if (!fieldsPath.empty())
+    {
+        if (!fields::Load(fieldsPath, poseMode ? pScale : 0.08f)) { std::fprintf(stderr, "ERROR: bad force field file: %s\n", fieldsPath.c_str()); return 1; }
+        fields::Install(model->GetMMDPhysics()->GetDynamicsWorld());
+        std::printf("force fields: %u\n", fields::Count());
+        std::fflush(stdout);
+    }
+
     // Warm up: blend from the rest pose into the first pose, then hold it so cloth settles.
     const int warmTotal = warmup + settle;
     if (poseMode)
@@ -390,6 +402,7 @@ int wmain(int argc, wchar_t** argv)
     int lastPct = -1;
     for (int f = 0; f < frameCount; f++)
     {
+        if (!fields::SetFrame((unsigned)f)) { std::fprintf(stderr, "ERROR: force field file truncated\n"); return 1; }
         if (poseMode)
         {
             if (f == 0) pFrame = pFirst;
