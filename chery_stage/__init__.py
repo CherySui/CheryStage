@@ -10,7 +10,7 @@ Features:
 bl_info = {
     "name": "CheryStage",
     "author": "Chery",
-    "version": (1, 8, 0),
+    "version": (1, 9, 0),
     "blender": (5, 0, 0),
     "location": "Graph Editor / Dope Sheet / 3D Viewport / Compositor > Sidebar > CheryStage",
     "description": "All-in-one MMD workflow toolkit for Blender (Keyframe Easing, MMD Physics Bake & Render Export)",
