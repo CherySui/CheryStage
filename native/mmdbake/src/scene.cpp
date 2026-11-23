@@ -48,6 +48,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "stream_io.h"
+
 namespace
 {
     // saba node space = MMD space with Z flipped; Blender (mmd_tools) = (x, -z, y) of saba space.
@@ -62,7 +64,7 @@ namespace
         return _wfopen(w.c_str(), mode);
     }
 
-    template <class T> bool Rd(FILE* f, T& v) { return std::fread(&v, sizeof(T), 1, f) == 1; }
+    template <class T> bool Rd(FILE* f, T& v) { return streamio::Read(&v, sizeof(T), 1, f) == 1; }
 
     glm::mat4 RT(const float* v, float invScale, const glm::mat3& A, const glm::mat3& At)
     {
@@ -131,7 +133,7 @@ namespace
     {
         m.pin = OpenW(m.posePath, L"rb");
         char magic[8]; uint32_t ver = 0;
-        if (!m.pin || std::fread(magic, 1, 8, m.pin) != 8 || std::memcmp(magic, "MMDPOSE1", 8) != 0
+        if (!m.pin || streamio::Read(magic, 1, 8, m.pin) != 8 || std::memcmp(magic, "MMDPOSE1", 8) != 0
             || !Rd(m.pin, ver) || !Rd(m.pin, m.pNb) || !Rd(m.pin, m.pNf) || !Rd(m.pin, m.first) || ver != 2)
             return false;
         std::unordered_map<std::string, size_t> byName;
@@ -141,8 +143,8 @@ namespace
         for (uint32_t i = 0; i < m.pNb; i++)
         {
             uint32_t len = 0; Rd(m.pin, len);
-            std::string name(len, '\0'); std::fread(name.data(), 1, len, m.pin);
-            std::fread(&heads[i], 4, 3, m.pin);
+            std::string name(len, '\0'); streamio::Read(name.data(), 1, len, m.pin);
+            streamio::Read(&heads[i], 4, 3, m.pin);
             auto it = byName.find(name);
             if (it != byName.end()) m.pMap[i] = (int)it->second;
         }
@@ -164,7 +166,7 @@ namespace
 
     bool ReadPoseFrame(SModel& m, std::vector<float>& dst)
     {
-        return std::fread(dst.data(), sizeof(float), dst.size(), m.pin) == dst.size();
+        return streamio::Read(dst.data(), sizeof(float), dst.size(), m.pin) == dst.size();
     }
 
     // Set every node of a model from a pose frame (weight < 1 blends from the rest pose).
@@ -239,7 +241,7 @@ namespace
     {
         fp = OpenW(path, L"rb");
         char magic[8]; uint32_t ver = 0;
-        if (!fp || std::fread(magic, 1, 8, fp) != 8 || std::memcmp(magic, "MMDCOLL1", 8) != 0
+        if (!fp || streamio::Read(magic, 1, 8, fp) != 8 || std::memcmp(magic, "MMDCOLL1", 8) != 0
             || !Rd(fp, ver) || !Rd(fp, nc) || !Rd(fp, nf) || !Rd(fp, first) || ver != 1)
             return false;
         out.resize(nc);
@@ -248,13 +250,13 @@ namespace
         {
             Collider& c = out[i];
             uint32_t len = 0; Rd(fp, len);
-            c.name.resize(len); std::fread(c.name.data(), 1, len, fp);
+            c.name.resize(len); streamio::Read(c.name.data(), 1, len, fp);
             uint8_t shape = 0; float margin = 0; glm::vec3 size, offset;
-            Rd(fp, shape); Rd(fp, margin); std::fread(&size, 4, 3, fp); std::fread(&offset, 4, 3, fp);
+            Rd(fp, shape); Rd(fp, margin); streamio::Read(&size, 4, 3, fp); streamio::Read(&offset, 4, 3, fp);
             uint32_t nv = 0; Rd(fp, nv);
-            std::vector<float> v(nv * 3); if (nv) std::fread(v.data(), 4, v.size(), fp);
+            std::vector<float> v(nv * 3); if (nv) streamio::Read(v.data(), 4, v.size(), fp);
             uint32_t nt = 0; Rd(fp, nt);
-            std::vector<uint32_t> tri(nt * 3); if (nt) std::fread(tri.data(), 4, tri.size(), fp);
+            std::vector<uint32_t> tri(nt * 3); if (nt) streamio::Read(tri.data(), 4, tri.size(), fp);
             c.offsetB = toB(offset);
             float r = size.x * invScale, h = size.z * invScale;
             switch (shape)
@@ -437,7 +439,7 @@ int RunScene(const std::string& specPath, int warmup, int settle, float fps, int
         WriteHeader(m, (int)nf, first);
         if (!ReadPoseFrame(m, m.firstFrame)) { std::fprintf(stderr, "ERROR: pose file truncated\n"); return 1; }
     }
-    if (cfp && std::fread(cFirstFrame.data(), sizeof(float), cFirstFrame.size(), cfp) != cFirstFrame.size()) { std::fprintf(stderr, "ERROR: collider file truncated\n"); return 1; }
+    if (cfp && streamio::Read(cFirstFrame.data(), sizeof(float), cFirstFrame.size(), cfp) != cFirstFrame.size()) { std::fprintf(stderr, "ERROR: collider file truncated\n"); return 1; }
 
     double tPhys = 0, tPose = 0;
     auto setColliders = [&](const std::vector<float>& fr) { for (uint32_t i = 0; i < cN; i++) SetColliderTransform(colliders[i], &fr[i * 7], invW); };
@@ -490,7 +492,7 @@ int RunScene(const std::string& specPath, int warmup, int settle, float fps, int
         if (cN)
         {
             if (f == 0) cFrame = cFirstFrame;
-            else if (std::fread(cFrame.data(), sizeof(float), cFrame.size(), cfp) != cFrame.size()) { std::fprintf(stderr, "ERROR: collider file truncated\n"); return 1; }
+            else if (streamio::Read(cFrame.data(), sizeof(float), cFrame.size(), cfp) != cFrame.size()) { std::fprintf(stderr, "ERROR: collider file truncated\n"); return 1; }
         }
         step(false, 1.0f);
         for (auto& m : models) WriteFrame(m);

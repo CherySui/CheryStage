@@ -30,7 +30,21 @@
 
 ## 安装
 
-从 [Releases](../../releases) 下载 `CheryStage_vX.Y.Z.zip`，在 Blender 中：编辑 → 偏好设置 → 扩展 → 从磁盘安装。
+### 从扩展仓库安装（推荐，可自动更新）
+
+1. Blender：编辑 → 偏好设置 → 获取扩展 → 右上角 **存储库** 下拉菜单 → **+** → **添加远程存储库**
+2. URL 填 `https://cherysui.github.io/CheryStage/index.json`，勾选 **启动时检查更新**
+3. 在获取扩展中搜索 **CheryStage**，点击安装
+
+之后有新版本时，获取扩展页面会提示更新。
+
+需要在 偏好设置 → 系统 中开启 **允许联机访问**。
+
+### 从文件安装
+
+从 [Releases](../../releases) 下载 `CheryStage_vX.Y.Z.zip`，在 Blender 中：编辑 → 偏好设置 → 获取扩展 → 右上角下拉菜单 → 从磁盘安装。这种方式不会自动更新。
+
+如果之前是从文件安装的，改用扩展仓库前先在 偏好设置 → 插件 中卸载旧版本。
 
 ## 使用
 
@@ -98,6 +112,13 @@ python tools/pack.py
 ```
 
 `build.py` 会拉取子模块、应用 `native/mmdbake/patches/` 中的补丁并编译 `mmdbake.exe`；`pack.py` 生成 `dist/CheryStage_vX.Y.Z.zip`。
+
+发布到扩展仓库（GitHub Pages，`gh-pages` 分支）：
+
+```bash
+python tools/repo.py --blender C:/path/to/blender.exe          # 生成 dist/repo/
+python tools/repo.py --blender C:/path/to/blender.exe --push   # 生成并推送到 gh-pages
+```
 
 ## 目录
 

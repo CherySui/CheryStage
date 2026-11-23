@@ -34,6 +34,6 @@ target_compile_options(saba PRIVATE -w)
 target_link_libraries(saba PUBLIC bullet)
 
 # ---- mmdbake CLI ----
-add_executable(mmdbake src/main.cpp src/scene.cpp)
+add_executable(mmdbake src/main.cpp src/scene.cpp src/stream_io.cpp)
 target_link_libraries(mmdbake PRIVATE saba)
 target_link_options(mmdbake PRIVATE -static -municode)

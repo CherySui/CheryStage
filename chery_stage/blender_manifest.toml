@@ -5,9 +5,10 @@ version = "1.7.0"
 name = "CheryStage"
 tagline = "All-in-one MMD workflow: easing, physics bake, render export"
 maintainer = "Chery"
+website = "https://github.com/CherySui/CheryStage"
 type = "add-on"
 
-tags = ["Animation", "Render", "Compositing", "Dopesheet", "Graph Editor", "Physics"]
+tags = ["Animation", "Bake", "Physics", "Render", "Pipeline"]
 
 blender_version_min = "5.0.0"
 platforms = ["windows-x64"]

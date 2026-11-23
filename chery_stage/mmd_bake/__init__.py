@@ -498,12 +498,14 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
         with open(spec, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines) + "\n")
         scene_fps = scene.render.fps / (scene.render.fps_base or 1.0)
-        self._args = [EXE_PATH, "--scene", spec] + self._common_args(s) + ["--dt", repr(1.0 / scene_fps)]
+        self._args = [EXE_PATH, "--scene", spec] + self._common_args(s) + [
+            "--dt", repr(1.0 / scene_fps), "--stream", str(os.getpid())]
         self._tmp = poses + outs + [spec] + ([coll] if coll else [])
         self._scene_arms = [a for _r, a in models]
         self._scene_outs = outs
         self._pose = poses[0]          # "from Blender" flag for offsets / timing
         self._sampler = pose_input.sample_scene(scene, self._scene_arms, colliders, f0, f1, poses, coll)
+        self._sample_total = f1 - f0 + 1
         self.report({"INFO"}, f"场景烘焙：{len(models)} 个模型，{len(colliders)} 个碰撞体")
         return True
 
@@ -568,7 +570,8 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
             f0, f1 = (s.start, max(s.start, s.end)) if s.use_range else (scene.frame_start, scene.frame_end)
             self._pose = os.path.join(tempfile.gettempdir(), f"mmdbake_{stamp}.mbp")
             scene_fps = scene.render.fps / (scene.render.fps_base or 1.0)
-            args += ["--pose", self._pose, "--dt", repr(1.0 / scene_fps)]
+            # --stream: mmdbake starts while the poses are still being read and follows the file
+            args += ["--pose", self._pose, "--dt", repr(1.0 / scene_fps), "--stream", str(os.getpid())]
             self._sampler = pose_input.sample_pose(scene, self._arm, f0, f1, self._pose)
             self._sample_total = f1 - f0 + 1
         elif s.use_range:
@@ -580,13 +583,14 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
         self._lines = []
         self._t0 = time.time()
         self._t_sampled = self._t0
+        self._t_proc = self._t0
         self._t_bake_start = None
         self._t_sim_end = None
         self._t_sim = 0.0
         self._gen = None
         self._phase = "sample" if from_blender else "sim"
         _Job.running = True
-        progress_hud.start()
+        progress_hud.start(stream=from_blender)
         if not from_blender and not self._start_proc():
             return self._finish(context, cancelled=True, msg="无法运行烘焙程序")
 
@@ -601,6 +605,7 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
         import threading
 
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        self._t_proc = time.time()
         try:
             self._proc = subprocess.Popen(self._args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                           creationflags=flags)
@@ -627,27 +632,57 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
             self.report({"ERROR"}, f"写入关键帧失败：{e}")
             return self._finish(context, cancelled=True, msg="写入关键帧失败")
 
-    # reading the action from Blender (Blender source only), part of the "预热" phase
+    # reading the action from Blender (Blender source only). mmdbake starts after the first chunk
+    # is on disk and simulates while the rest is read (pipelined).
     def _tick_sample(self, context):
+        if self._proc is not None and self._proc.poll() not in (None, 0):
+            return self._tick_sim(context)   # baker failed early: report it
         deadline = time.time() + 0.05
         while time.time() < deadline:
             kind, a, b = next(self._sampler)
+            if self._proc is None and not self._start_proc():
+                return self._finish(context, cancelled=True, msg="无法运行烘焙程序")
             if kind == "sample":
-                self._set(context, 0.05 * a / max(1, b), f"读取 Blender 动作 {a}/{b} 帧", 0, 0.5 * a / max(1, b))
+                self._stream_progress(context, a, b)
             elif kind == "sampled":
                 self._sampler = None
                 self._t_sampled = time.time()
-                if not self._start_proc():
-                    return self._finish(context, cancelled=True, msg="无法运行烘焙程序")
                 self._phase = "sim"
                 return {"RUNNING_MODAL"}
         return {"RUNNING_MODAL"}
+
+    def _phys_state(self):
+        """(frames simulated, frames total, (warm-up done, total) or None) from mmdbake's output."""
+        for line in reversed(self._lines[-8:]):
+            if line.startswith("PROGRESS "):
+                a, b = line.split()[1].split("/")
+                return int(a), int(b), None
+            if line.startswith("WARMUP "):
+                a, b = line.split()[1].split("/")
+                return 0, 0, (int(a), int(b))
+        return 0, 0, None
+
+    def _stream_progress(self, context, read, total):
+        """Blender source: reading and physics run together (buffer-bar HUD)."""
+        done, _n, warm = self._phys_state()
+        elapsed = time.time() - self._t0
+        if read < total:
+            text = f"读取动作并计算物理  {elapsed:.0f}s"
+        elif warm:
+            text = f"读取完成 · 物理预热中  {elapsed:.0f}s"
+        else:
+            text = f"读取完成 · 物理计算中  {elapsed:.0f}s"
+        progress_hud.stream_update(read, done, total, warm=warm, text=text)
+        pv = done / max(1, total)
+        self._set(context, 0.70 * pv, f"已读取 {read}/{total} · 已计算 {done}/{total} 帧")
 
     # physics simulation (external process): 0% .. 70%
     def _tick_sim(self, context):
         last = self._lines[-1] if self._lines else ""
         elapsed = time.time() - self._t0
-        if last.startswith("WARMUP "):
+        if self._pose:
+            self._stream_progress(context, self._sample_total, self._sample_total)
+        elif last.startswith("WARMUP "):
             a, b = last.split()[1].split("/")
             base = 0.5 if self._pose else 0.0
             self._set(context, 0.05 * int(a) / max(1, int(b)), f"物理预热 {a}/{b} 帧  {elapsed:.0f}s",
@@ -722,7 +757,7 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
         t_end = time.time()
         bake_start = self._t_bake_start or self._t_sim_end
         sample = self._t_sampled - self._t0
-        prep = bake_start - self._t_sampled
+        prep = bake_start - self._t_proc
         bake = self._t_sim_end - bake_start
         imp = t_end - self._t_sim_end
         total = t_end - self._t0
@@ -730,9 +765,10 @@ class CHERY_OT_mmd_bake(bpy.types.Operator):
                          source="Blender 动作" if self._pose else "VMD")
         lines = [
             "[CheryStage] MMD 物理烘焙完成（动作来源：" + _Job.last["source"] + "）",
-        ] + ([f"  读取动作：{_fmt_s(sample)}（从 Blender 逐帧读取 {frames} 帧姿势）"] if self._pose else []) + [
+        ] + ([f"  读取动作：{_fmt_s(sample)}（从 Blender 逐帧读取 {frames} 帧姿势，与物理计算同时进行）"]
+             if self._pose else []) + [
             f"  准备阶段：{_fmt_s(prep)}（加载模型与动作、物理预热）",
-            f"  烘焙阶段：{_fmt_s(bake)}（{frames} 帧物理计算）",
+            f"  烘焙阶段：{_fmt_s(bake)}（{frames} 帧物理计算" + ("，含等待读取动作）" if self._pose else "）"),
             f"  导入阶段：{_fmt_s(imp)}（写入 {bones} 根物理骨骼的关键帧）",
             f"  总计：{_fmt_s(total)}　Blender 帧 {f0}-{f1}，比例 {scale:.4f}",
         ]

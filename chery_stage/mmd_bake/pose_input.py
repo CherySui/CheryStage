@@ -2,7 +2,8 @@
 """Sample the evaluated pose of an MMD Tools armature from Blender and write it for mmdbake.
 
 This lets the baker follow whatever animation is in Blender (hand-keyed edits, IK, constraints)
-instead of re-reading the original VMD file.
+instead of re-reading the original VMD file. The file is flushed every few frames: mmdbake runs at
+the same time (--stream) and simulates frames as soon as they are on disk.
 
 .mbp layout (little endian):
   char[8] "MMDPOSE1"; u32 version(=1); u32 boneCount; u32 frameCount; i32 firstFrame
@@ -126,6 +127,7 @@ def sample_pose(scene, arm, frame_start, frame_end, path, chunk=8):
             out[:, 4:7] = s[:, :3, 3]
             f.write(out.tobytes())
             if (i + 1) % chunk == 0:
+                f.flush()   # mmdbake reads the file while it is being written
                 yield ("sample", i + 1, nf)
     yield ("sampled", nf, None)
 
@@ -263,5 +265,9 @@ def sample_scene(scene, arms, colliders, frame_start, frame_end, pose_paths, col
                     cbuf[k] = _rot_loc(ob.matrix_world)
                 cf.write(cbuf.tobytes())
             if (i + 1) % chunk == 0:
+                for f in files:
+                    f.flush()   # mmdbake reads the files while they are being written
+                if cf:
+                    cf.flush()
                 yield ("sample", i + 1, nf)
     yield ("sampled", nf, None)

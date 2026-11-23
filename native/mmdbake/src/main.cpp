@@ -4,6 +4,7 @@
 // Usage: mmdbake <model.pmx> <motion.vmd | -> <out.mbk> [options]
 //   --pose F.mbp     drive the model with poses sampled from Blender instead of the VMD
 //                    (frames come from the file; --start/--end are ignored)
+//   --stream PID     pose / collider files are still being written by process PID: wait for data
 //   --dt S           seconds per frame (default 1/30); use 1/scene_fps for Blender input
 //   --start N        first frame (default 0)
 //   --end N          last frame (default: last key in the VMD)
@@ -44,6 +45,7 @@
 #include <thread>
 #include <unordered_map>
 #include <LinearMath/btThreads.h>
+#include "stream_io.h"
 
 namespace saba { extern int g_mmdPhysicsThreads; }
 
@@ -59,7 +61,7 @@ static void Usage()
     std::fprintf(stderr,
         "usage: mmdbake <model.pmx> <motion.vmd> <out.mbk> [--start N] [--end N]\n"
         "               [--warmup N] [--settle N] [--fps F] [--substeps N] [--threads N]\n"
-        "               [--pose file.mbp] [--dt seconds]\n");
+        "               [--pose file.mbp] [--dt seconds] [--stream pid]\n");
 }
 
 int RunScene(const std::string& specPath, int warmup, int settle, float fps, int substeps, float dt);
@@ -96,6 +98,7 @@ int wmain(int argc, wchar_t** argv)
         else if (a == "--threads") threads = std::max(1, std::stoi(next()));
         else if (a == "--pose") posePath = next();
         else if (a == "--dt") dt = std::stof(next());
+        else if (a == "--stream") streamio::Enable(std::stoul(next()));
         else { std::fprintf(stderr, "unknown option: %s\n", a.c_str()); Usage(); return 2; }
     }
 
@@ -179,9 +182,9 @@ int wmain(int argc, wchar_t** argv)
         pfp = _wfopen(wp.c_str(), L"rb");
         char magic[8];
         uint32_t ver = 0; int32_t first = 0;
-        if (!pfp || std::fread(magic, 1, 8, pfp) != 8 || std::memcmp(magic, "MMDPOSE1", 8) != 0
-            || std::fread(&ver, 4, 1, pfp) != 1 || std::fread(&pNb, 4, 1, pfp) != 1
-            || std::fread(&pNf, 4, 1, pfp) != 1 || std::fread(&first, 4, 1, pfp) != 1 || ver != 1)
+        if (!pfp || streamio::Read(magic, 1, 8, pfp) != 8 || std::memcmp(magic, "MMDPOSE1", 8) != 0
+            || streamio::Read(&ver, 4, 1, pfp) != 1 || streamio::Read(&pNb, 4, 1, pfp) != 1
+            || streamio::Read(&pNf, 4, 1, pfp) != 1 || streamio::Read(&first, 4, 1, pfp) != 1 || ver != 1)
         {
             std::fprintf(stderr, "ERROR: bad pose file: %s\n", posePath.c_str());
             return 1;
@@ -193,9 +196,9 @@ int wmain(int argc, wchar_t** argv)
         size_t matched = 0;
         for (uint32_t i = 0; i < pNb; i++)
         {
-            uint32_t len = 0; std::fread(&len, 4, 1, pfp);
-            std::string name(len, '\0'); std::fread(name.data(), 1, len, pfp);
-            std::fread(&heads[i], 4, 3, pfp);
+            uint32_t len = 0; streamio::Read(&len, 4, 1, pfp);
+            std::string name(len, '\0'); streamio::Read(name.data(), 1, len, pfp);
+            streamio::Read(&heads[i], 4, 3, pfp);
             auto it = byName.find(name);
             if (it != byName.end()) { pMap[i] = (int)it->second; matched++; }
         }
@@ -357,7 +360,7 @@ int wmain(int argc, wchar_t** argv)
         tPhys += since(d);
     };
     auto readPoseFrame = [&](std::vector<float>& dst) -> bool {
-        return std::fread(dst.data(), sizeof(float), dst.size(), pfp) == dst.size();
+        return streamio::Read(dst.data(), sizeof(float), dst.size(), pfp) == dst.size();
     };
 
     // Warm up: blend from the rest pose into the first pose, then hold it so cloth settles.
