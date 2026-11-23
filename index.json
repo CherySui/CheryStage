@@ -1,0 +1,36 @@
+{
+  "version": "v1",
+  "blocklist": [],
+  "data": [
+    {
+      "schema_version": "1.0.0",
+      "id": "chery_stage",
+      "name": "CheryStage",
+      "tagline": "All-in-one MMD workflow: easing, physics bake, render export",
+      "version": "1.7.0",
+      "type": "add-on",
+      "maintainer": "Chery",
+      "license": [
+        "SPDX:GPL-2.0-or-later"
+      ],
+      "blender_version_min": "5.0.0",
+      "permissions": {
+        "files": "Create output folders, read PMX/VMD and run the physics baker"
+      },
+      "tags": [
+        "Animation",
+        "Render",
+        "Compositing",
+        "Dopesheet",
+        "Graph Editor",
+        "Physics"
+      ],
+      "platforms": [
+        "windows-x64"
+      ],
+      "archive_url": "./CheryStage_v1.7.0.zip",
+      "archive_size": 1548569,
+      "archive_hash": "sha256:023180d0ed59496a3da550f5ef3975c19eedf006ee84d26f68e01c0e905e4fff"
+    }
+  ]
+}
