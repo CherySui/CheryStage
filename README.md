@@ -19,8 +19,9 @@
 ## 功能
 
 - **关键帧缓动库**：36 种缓动预设，可在曲线编辑器、动画摄影表、3D 视图中使用，`Alt + E` 呼出
-- **MMD 物理烘焙**：用外置的 MMD 式 Bullet 物理（[saba](https://github.com/benikabocha/saba) + [Bullet](https://github.com/bulletphysics/bullet3)）烘焙物理骨骼，可按 Blender 中的动作烘焙，结果放在独立的 NLA 物理层
+- **MMD 物理烘焙**：用外置的 MMD 式 Bullet 物理（[saba](https://github.com/benikabocha/saba) + [Bullet](https://github.com/bulletphysics/bullet3)）烘焙物理骨骼，可按 Blender 中的动作烘焙（边读取边计算），结果放在独立的 NLA 物理层；支持多模型与场景碰撞体（测试阶段）
 - **渲染导出**：输出类型、分辨率、帧率（含时间拉伸）、透明背景、输出位置
+- **自动更新**：通过 Blender 扩展存储库安装，有新版本时自动提示
 
 ## 要求
 
@@ -30,21 +31,26 @@
 
 ## 安装
 
-### 从扩展仓库安装（推荐，可自动更新）
+### 从扩展存储库安装（推荐，可自动更新）
 
-1. Blender：编辑 → 偏好设置 → 获取扩展 → 右上角 **存储库** 下拉菜单 → **+** → **添加远程存储库**
-2. URL 填 `https://cherysui.github.io/CheryStage/index.json`，勾选 **启动时检查更新**
-3. 在获取扩展中搜索 **CheryStage**，点击安装
+存储库地址：
 
-之后有新版本时，获取扩展页面会提示更新。
+```
+https://cherysui.github.io/CheryStage/index.json
+```
 
-需要在 偏好设置 → 系统 中开启 **允许联机访问**。
+1. 偏好设置 → 系统 中开启 **允许联机访问**
+2. 编辑 → 偏好设置 → 获取扩展 → 右上角 **存储库** 下拉菜单 → **+** → **添加远程存储库**
+3. URL 填上面的地址，勾选 **启动时检查更新**
+4. 在获取扩展中搜索 **CheryStage**，点击安装
+
+之后有新版本时，Blender 会在获取扩展页面提示更新，点击即可升级。
 
 ### 从文件安装
 
 从 [Releases](../../releases) 下载 `CheryStage_vX.Y.Z.zip`，在 Blender 中：编辑 → 偏好设置 → 获取扩展 → 右上角下拉菜单 → 从磁盘安装。这种方式不会自动更新。
 
-如果之前是从文件安装的，改用扩展仓库前先在 偏好设置 → 插件 中卸载旧版本。
+如果之前是从文件安装的，改用扩展存储库前先在 偏好设置 → 插件 中卸载旧版本。
 
 ## 使用
 
